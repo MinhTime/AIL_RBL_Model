@@ -10,8 +10,14 @@ Responsibilities
 2. Map the 15 original annotation symbols into the 5 AAMI target classes:
    N, SVEB, VEB, FB (F), Q.
 3. Split the data into 80% training / 20% testing (stratified).
-4. Balance the training set by up-sampling each *minority* class to exactly
-   20,000 samples using random sampling with replacement.
+4. Balance the *training* set by up-sampling each minority class to a target
+   count. Two strategies are supported:
+      * ``duplicate`` - random over-sampling with replacement (the original,
+        paper-faithful behaviour: exact copies of existing beats);
+      * ``smote`` / ``borderline`` / ``adasyn`` - **synthetic** minority
+        over-sampling that interpolates new beats between real neighbours
+        (see ``synthetic.py``). This is the modification introduced in this
+        work: instead of duplicating beats we *generate* new, diverse ones.
 
 Notes
 -----
@@ -20,8 +26,8 @@ The MIT-BIH Arrhythmia Database must be available locally as WFDB records
     https://physionet.org/content/mitdb/1.0.0/
 or programmatically with ``wfdb.dl_database('mitdb', dl_dir=...)``.
 
-This module reads the raw waveforms so that the downstream preprocessing
-(wavelet denoising + median baseline removal) can operate on actual signals.
+Balancing always runs *after* the train/test split and only on the training
+data, so no synthetic information can leak into the held-out test set.
 """
 
 from __future__ import annotations
@@ -35,19 +41,21 @@ import numpy as np
 from sklearn.model_selection import train_test_split
 from sklearn.utils import resample
 
+import synthetic as syn
+
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # AAMI mapping: 15 raw MIT-BIH annotation symbols -> 5 target classes.
 #
 # The paper (Table 1) summarises the 15 MIT-BIH heartbeat types into the five
-# AAMI EC57 classes.  We use the de Chazal et al. mapping, which is the
+# AAMI EC57 classes. We use the de Chazal et al. mapping, which is the
 # community-standard interpretation of the AAMI grouping:
-#   N    (Normal)                 : N, L, R, e, j
-#   SVEB (Supraventricular ectopic): A, a, J, S
-#   VEB  (Ventricular ectopic)    : V, E
-#   F    (Fusion)                 : F
-#   Q    (Unknown / paced)        : /, f, Q
+#   N    (Normal)                     : N, L, R, e, j
+#   SVEB (Supraventricular ectopic)   : A, a, J, S
+#   VEB  (Ventricular ectopic)        : V, E
+#   F    (Fusion)                     : F
+#   Q    (Unknown / paced)            : /, f, Q
 # ---------------------------------------------------------------------------
 AAMI_CLASSES: Tuple[str, ...] = ("N", "SVEB", "VEB", "FB", "Q")
 
@@ -64,14 +72,14 @@ SYMBOL_TO_AAMI: Dict[str, str] = {
     "J": "SVEB",  # Nodal (junctional) premature beat
     "S": "SVEB",  # Supraventricular premature beat
     # --- VEB : Ventricular ectopic ---------------------------------------
-    "V": "VEB",  # Premature ventricular contraction
-    "E": "VEB",  # Ventricular escape beat
+    "V": "VEB",   # Premature ventricular contraction
+    "E": "VEB",   # Ventricular escape beat
     # --- FB : Fusion ------------------------------------------------------
-    "F": "FB",   # Fusion of ventricular and normal beat
+    "F": "FB",    # Fusion of ventricular and normal beat
     # --- Q : Unknown / paced ---------------------------------------------
-    "/": "Q",    # Paced beat
-    "f": "Q",    # Fusion of paced and normal beat
-    "Q": "Q",    # Unclassifiable beat
+    "/": "Q",     # Paced beat
+    "f": "Q",     # Fusion of paced and normal beat
+    "Q": "Q",     # Unclassifiable beat
 }
 
 # Integer label encoding used throughout the pipeline (and in the confusion
@@ -213,21 +221,13 @@ def balance_by_upsampling(
     target_per_minority: int = 20_000,
     random_state: int = 42,
 ) -> BeatDataset:
-    """Up-sample every *minority* class to exactly ``target_per_minority`` samples.
+    """Up-sample every *minority* class by DUPLICATION (with replacement).
 
-    The majority class (whichever class is the largest) is left untouched; each
-    of the remaining classes is resampled *with replacement* up to the target.
-    This reproduces the paper's normalisation step (20,000 samples per minority
-    class).
-
-    Parameters
-    ----------
-    dataset : BeatDataset
-        The (training) dataset to balance.
-    target_per_minority : int, default 20_000
-        Desired sample count for each minority class.
-    random_state : int, default 42
-        Reproducibility seed for the random resampling.
+    This is the original, paper-faithful strategy: each minority class is
+    resampled *with replacement* up to ``target_per_minority`` samples, so the
+    added beats are exact copies of existing ones. The majority class is left
+    untouched. Kept as a baseline for comparison against the synthetic
+    (``balance_by_smote``) strategy.
     """
     counts = dataset.class_distribution()
     majority_class = max(counts, key=counts.get)
@@ -244,13 +244,11 @@ def balance_by_upsampling(
         if X_cls.shape[0] == 0:
             logger.warning("Class %s has no samples; skipping.", class_name)
             continue
-
         if class_int == majority_int:
             # Keep the majority class exactly as-is.
             X_parts.append(X_cls)
             y_parts.append(y_cls)
             continue
-
         # Up-sample the minority class with replacement to the target size.
         X_up, y_up = resample(
             X_cls,
@@ -261,7 +259,7 @@ def balance_by_upsampling(
         )
         X_parts.append(X_up)
         y_parts.append(y_up)
-        logger.info("Up-sampled %s: %d -> %d.", class_name, X_cls.shape[0], target_per_minority)
+        logger.info("Duplicated %s: %d -> %d.", class_name, X_cls.shape[0], target_per_minority)
 
     X_balanced = np.vstack(X_parts)
     y_balanced = np.concatenate(y_parts)
@@ -270,5 +268,73 @@ def balance_by_upsampling(
     rng = np.random.default_rng(random_state)
     perm = rng.permutation(len(y_balanced))
     balanced = BeatDataset(X_balanced[perm], y_balanced[perm])
-    logger.info("Balanced training distribution: %s", balanced.class_distribution())
+    logger.info("Balanced (duplicate) training distribution: %s", balanced.class_distribution())
     return balanced
+
+
+def balance_by_smote(
+    dataset: BeatDataset,
+    target_per_minority: int = 20_000,
+    k_neighbors: int = 5,
+    random_state: int = 42,
+    method: str = "smote",
+) -> BeatDataset:
+    """Up-sample every minority class with SYNTHETIC beats (SMOTE family).
+
+    Unlike :func:`balance_by_upsampling`, the added beats are *not* copies:
+    each new beat is interpolated between a real minority beat and one of its
+    ``k_neighbors`` nearest same-class neighbours (see ``synthetic.py``). This
+    yields a more diverse, less redundant training set.
+
+    Parameters
+    ----------
+    dataset : BeatDataset
+        The (training) dataset to balance - raw R-peak-centred beat segments.
+    target_per_minority : int, default 20_000
+        Desired sample count for each minority class.
+    k_neighbors : int, default 5
+        Number of nearest neighbours used for interpolation.
+    random_state : int, default 42
+        Reproducibility seed.
+    method : {"smote", "borderline", "adasyn"}, default "smote"
+        Which synthetic-oversampling variant to use.
+    """
+    before = dataset.class_distribution()
+    X_res, y_res = syn.balance_xy(
+        dataset.X,
+        dataset.y,
+        method=method,
+        target_per_minority=target_per_minority,
+        k_neighbors=k_neighbors,
+        random_state=random_state,
+    )
+    balanced = BeatDataset(X=X_res.astype(np.float64), y=y_res.astype(np.int64))
+    logger.info("Balanced (%s) training distribution: %s -> %s",
+                method, before, balanced.class_distribution())
+    return balanced
+
+
+def balance_training_set(
+    dataset: BeatDataset,
+    method: str = "smote",
+    target_per_minority: int = 20_000,
+    k_neighbors: int = 5,
+    random_state: int = 42,
+) -> BeatDataset:
+    """Dispatch balancing to the chosen strategy.
+
+    ``method="duplicate"`` reproduces the original copy-with-replacement
+    behaviour; any other value ("smote", "borderline", "adasyn") produces
+    synthetic beats.
+    """
+    if method == "duplicate":
+        return balance_by_upsampling(
+            dataset, target_per_minority=target_per_minority, random_state=random_state
+        )
+    return balance_by_smote(
+        dataset,
+        target_per_minority=target_per_minority,
+        k_neighbors=k_neighbors,
+        random_state=random_state,
+        method=method,
+    )

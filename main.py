@@ -2,25 +2,42 @@
 main.py
 =======
 End-to-end driver for the ECG classification pipeline, tying together
-``dataset.py``, ``preprocess.py``, ``feature_extraction.py`` and ``trainer.py``.
+``dataset.py``, ``preprocess.py``, ``feature_extraction.py``, ``synthetic.py``
+and ``trainer.py``.
 
-Pipeline (paper Figure 4)
--------------------------
+Pipeline (paper Figure 4, with our modified balancing step)
+-----------------------------------------------------------
     load raw beats
-        -> stratified 80/20 split
-        -> balance training set (up-sample minorities to 20,000)
-        -> pre-process (wavelet denoise + median baseline removal)
-        -> feature extraction (R-peaks, QRS, stats, HOS, FFT)
-        -> train Random Forest  -> checkpoint
-        -> evaluate (confusion matrix, accuracy, sensitivity, specificity, PPV)
+      -> stratified 80/20 split
+      -> balance TRAINING set  (SMOTE synthetic beats by default; 'duplicate'
+                                reproduces the original copy-with-replacement)
+      -> pre-process (wavelet denoise + median baseline removal)
+      -> feature extraction (R-peaks, QRS, stats, HOS, FFT)
+      -> train Random Forest -> checkpoint
+      -> evaluate (confusion matrix, accuracy, sensitivity, specificity, PPV)
+
+Balancing space
+---------------
+``--balance-space signal``  (default) balances the raw beat segments *before*
+feature extraction (so synthetic beats also flow through denoising + feature
+extraction, exactly like real beats).
+``--balance-space feature`` balances the *extracted feature vectors* instead,
+which is the classic setting SMOTE was designed for. In both cases only the
+training split is ever balanced.
 
 Usage
 -----
-    # Train (and immediately evaluate) on the MIT-BIH records in ./mitdb
-    python main.py train --data-dir ./mitdb --model-out rf_model.joblib
+    # Train with SMOTE synthetic oversampling (new default) and evaluate
+    python main.py train --data-dir ./mitdb --model-out rf_model.joblib --verbose
+
+    # Reproduce the original behaviour (exact-copy duplication)
+    python main.py train --data-dir ./mitdb --balance-method duplicate
+
+    # SMOTE in feature space with Borderline-SMOTE
+    python main.py train --data-dir ./mitdb --balance-method borderline --balance-space feature
 
     # Evaluate independently using a saved checkpoint
-    python main.py test  --data-dir ./mitdb --model-in  rf_model.joblib
+    python main.py test --data-dir ./mitdb --model-in rf_model.joblib
 
 The split uses a fixed random seed, so the held-out test set is identical
 between the ``train`` and ``test`` runs.
@@ -36,6 +53,7 @@ import numpy as np
 import dataset as ds
 import feature_extraction as fe
 import preprocess as pp
+import synthetic as syn
 import trainer as tr
 
 
@@ -108,11 +126,28 @@ def run_train(args: argparse.Namespace) -> None:
     train_beats, test_beats = ds.split_train_test(
         beats, test_size=args.test_size, random_state=args.seed
     )
-    train_beats = ds.balance_by_upsampling(
-        train_beats, target_per_minority=args.target_per_minority, random_state=args.seed
-    )
 
-    X_train, y_train, X_test, y_test = _build_feature_matrices(train_beats, test_beats, args)
+    if args.balance_space == "signal":
+        # Balance the raw beat segments, then extract features from real+synthetic.
+        train_beats = ds.balance_training_set(
+            train_beats,
+            method=args.balance_method,
+            target_per_minority=args.target_per_minority,
+            k_neighbors=args.smote_k_neighbors,
+            random_state=args.seed,
+        )
+        X_train, y_train, X_test, y_test = _build_feature_matrices(train_beats, test_beats, args)
+    else:
+        # Extract features first, then synthesise in feature space (classic SMOTE).
+        X_train, y_train, X_test, y_test = _build_feature_matrices(train_beats, test_beats, args)
+        X_train, y_train = syn.balance_xy(
+            X_train,
+            y_train,
+            method=args.balance_method,
+            target_per_minority=args.target_per_minority,
+            k_neighbors=args.smote_k_neighbors,
+            random_state=args.seed,
+        )
 
     model = tr.train_random_forest(X_train, y_train, random_state=args.seed)
     tr.save_model(model, args.model_out)
@@ -142,6 +177,7 @@ def run_test(args: argparse.Namespace) -> None:
         )
     else:
         X_test_sig = test_beats.X
+
     X_test = fe.extract_features_batch(X_test_sig, thres=args.peak_thres, min_dist=args.peak_min_dist)
 
     model = tr.load_model(args.model_in)
@@ -174,6 +210,17 @@ def build_parser() -> argparse.ArgumentParser:
     p_train.add_argument("--model-out", default="rf_model.joblib", help="Checkpoint output path.")
     p_train.add_argument("--target-per-minority", type=int, default=20_000,
                          help="Up-sampling target for each minority class.")
+    # --- balancing strategy (the modified pre-processing step) --------------
+    p_train.add_argument("--balance-method",
+                         choices=["duplicate", "smote", "borderline", "adasyn"],
+                         default="smote",
+                         help="Minority balancing: 'duplicate' = original exact-copy "
+                              "over-sampling; others synthesise new beats.")
+    p_train.add_argument("--balance-space", choices=["signal", "feature"], default="signal",
+                         help="Synthesise in raw-signal space (before feature extraction) "
+                              "or in the extracted feature space.")
+    p_train.add_argument("--smote-k-neighbors", type=int, default=5,
+                         help="Nearest neighbours used by the SMOTE-family samplers.")
 
     p_test = sub.add_parser("test", help="Evaluate using a saved checkpoint.")
     add_common(p_test)
